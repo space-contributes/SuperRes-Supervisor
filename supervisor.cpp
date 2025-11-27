@@ -2,9 +2,6 @@
 // Enhanced SuperRes Supervisor with CUDA-accelerated Motion Estimation & AI Upscaling
 // Added HDR10+ metadata, real-time color editing, DirectComposition rendering, memory safety, and multiple interpolations
 
-// Removed macro redefinitions since they're already defined on command line
-// #define WIN32_LEAN_AND_MEAN
-// #define NOMINMAX
 #include <initguid.h>
 #include <dxgi1_2.h>
 #include <d3d11.h>
@@ -20,7 +17,7 @@
 #include <iostream>
 #include <fstream>
 #include <vector>
-#include <algorithm>  // Added for min and clamp functions
+#include <algorithm>
 #include <mutex>
 #include <atomic>
 #include <cmath>
@@ -46,9 +43,7 @@
 #define MAX(a,b) ((a) > (b) ? (a) : (b))
 #define CLAMP(val, min_val, max_val) ((val) < (min_val) ? (min_val) : ((val) > (max_val) ? (max_val) : (val)))
 
-// =================================================================
-// == FIX 1: Define structs BEFORE using them in extern "C" block ==
-// =================================================================
+// Struct definitions
 struct Color { 
     float r, g, b, a; 
 };
@@ -58,11 +53,7 @@ struct MotionVector {
     float confidence;
 };
 
-// =================================================================
-// == FIX 2: Corrected and relocated extern "C" block ==
-// This declares the host-side wrapper functions, not the __global__ kernels.
-// It is placed AFTER the struct definitions so the compiler knows what 'Color' and 'MotionVector' are.
-// =================================================================
+// Host-side wrapper function declarations
 extern "C" {
     void launchMotionEstimationKernel(
         const unsigned char* currentFrame,
@@ -129,6 +120,15 @@ struct ColorEditingParams {
                           hue(0.0f), gamma(1.0f) {}
 };
 
+// GDIColorMetrics structure
+struct GDIColorMetrics {
+    float gammaR, gammaG, gammaB;        // Per-channel gamma approximation
+    float brightness;                    // Brightness derived from ramp centroid
+    float contrast;                      // Contrast derived from ramp slope
+    float deltaR, deltaG, deltaB;        // White point deviations
+    WORD  ramp[3][256];                  // Raw LUT
+};
+
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "dcomp.lib")
@@ -159,7 +159,7 @@ static ColorTransformParams colorTransformParams;
 static ColorEditingParams colorEditingParams;
 static HDR10PlusMetadata hdrMetadata;
 
-// Frame data history - moved here to fix undeclared identifier errors
+// Frame data history
 static std::vector<std::vector<uint8_t>> frameDataHistory;
 
 // -------------------- RAII Wrappers for DirectX Resources --------------------
@@ -336,11 +336,9 @@ static void estimateMotion(FrameBuffer& current, FrameBuffer& previous) {
                        previous.width * previous.height * 4 * sizeof(unsigned char),
                        cudaMemcpyHostToDevice, cudaStream);
         
-        // =================================================================
-        // == FIX 3: Corrected kernel call in estimateMotion ==
-        // The previous code was incorrectly calling launchUpscalingKernel here.
-        // =================================================================
-        launchMotionEstimationKernel(d_currentFrame, d_previousFrame, current.width, current.height, d_motionField, MOTION_BLOCK_SIZE, MAX_MOTION_VECTOR);
+        // Correct kernel call
+        launchMotionEstimationKernel(d_currentFrame, d_previousFrame, current.width, current.height, 
+                                    d_motionField, MOTION_BLOCK_SIZE, MAX_MOTION_VECTOR);
 
         cudaMemcpyAsync(current.motionField.data(), d_motionField,
                        blocksX * blocksY * sizeof(MotionVector),
@@ -493,7 +491,14 @@ static std::vector<uint8_t> upscaleFrame(const std::vector<uint8_t>& input, int 
                        cudaMemcpyHostToDevice, cudaStream);
         
         // Kernel launch
-        launchUpscalingKernel(d_currentFrame, d_upscaledFrame, inW, inH, outW, outH, scaleX, scaleY, upscalingModel.sharpnessFactor, colorEditingParams.brightness, colorEditingParams.contrast, colorEditingParams.saturation, colorEditingParams.hue, colorEditingParams.gamma, colorTransformParams.w, colorTransformParams.x, colorTransformParams.y, colorTransformParams.z, colorTransformParams.eta, colorTransformParams.chromaStretch, colorTransformParams.hueWarp, colorTransformParams.lightnessFlow);
+        launchUpscalingKernel(d_currentFrame, d_upscaledFrame, inW, inH, outW, outH, scaleX, scaleY, 
+                             upscalingModel.sharpnessFactor, colorEditingParams.brightness, 
+                             colorEditingParams.contrast, colorEditingParams.saturation, 
+                             colorEditingParams.hue, colorEditingParams.gamma, 
+                             colorTransformParams.w, colorTransformParams.x, 
+                             colorTransformParams.y, colorTransformParams.z, 
+                             colorTransformParams.eta, colorTransformParams.chromaStretch, 
+                             colorTransformParams.hueWarp, colorTransformParams.lightnessFlow);
 
         cudaMemcpyAsync(output.data(), d_upscaledFrame,
                        outW * outH * 4 * sizeof(unsigned char),
@@ -1033,6 +1038,203 @@ static void applyColorTransform(std::vector<uint8_t>& frame, int w, int h) {
     }
 }
 
+// -------------------- Dynamic Color Analysis --------------------
+static void analyzeFrameAndAdjustParams(std::vector<uint8_t>& frame, int w, int h) {
+    // Calculate average brightness
+    float avgBrightness = 0.0f;
+    int pixelCount = w * h;
+    
+    for (int i = 0; i < pixelCount * 4; i += 4) {
+        float r = frame[i + 2] / 255.0f;
+        float g = frame[i + 1] / 255.0f;
+        float b = frame[i + 0] / 255.0f;
+        avgBrightness += (0.299f * r + 0.587f * g + 0.114f * b);
+    }
+    avgBrightness /= pixelCount;
+    
+    // Calculate average color balance
+    float avgR = 0.0f, avgG = 0.0f, avgB = 0.0f;
+    for (int i = 0; i < pixelCount * 4; i += 4) {
+        avgR += frame[i + 2] / 255.0f;
+        avgG += frame[i + 1] / 255.0f;
+        avgB += frame[i + 0] / 255.0f;
+    }
+    avgR /= pixelCount;
+    avgG /= pixelCount;
+    avgB /= pixelCount;
+    
+    // Calculate contrast (simplified)
+    float contrast = 0.0f;
+    for (int i = 0; i < pixelCount * 4; i += 4) {
+        float r = frame[i + 2] / 255.0f;
+        float g = frame[i + 1] / 255.0f;
+        float b = frame[i + 0] / 255.0f;
+        float lum = 0.299f * r + 0.587f * g + 0.114f * b;
+        contrast += (lum - avgBrightness) * (lum - avgBrightness);
+    }
+    contrast = sqrtf(contrast / pixelCount);
+    
+    // Adjust parameters based on analysis
+    // Brightness correction
+    if (avgBrightness < 0.3f) {
+        colorEditingParams.brightness += 0.05f;
+    } else if (avgBrightness > 0.7f) {
+        colorEditingParams.brightness -= 0.05f;
+    }
+    
+    // Contrast correction
+    if (contrast < 0.2f) {
+        colorEditingParams.contrast += 0.1f;
+    } else if (contrast > 0.4f) {
+        colorEditingParams.contrast -= 0.05f;
+    }
+    
+    // Color balance correction
+    float gray = (avgR + avgG + avgB) / 3.0f;
+    colorTransformParams.w = 1.0f + (gray - avgR) * 0.5f;
+    colorTransformParams.x = 1.0f + (gray - avgG) * 0.5f;
+    colorTransformParams.y = 1.0f + (gray - avgB) * 0.5f;
+    
+    // Clamp values
+    colorEditingParams.brightness = CLAMP(colorEditingParams.brightness, -0.5f, 0.5f);
+    colorEditingParams.contrast = CLAMP(colorEditingParams.contrast, 0.5f, 2.0f);
+    colorTransformParams.w = CLAMP(colorTransformParams.w, 0.5f, 1.5f);
+    colorTransformParams.x = CLAMP(colorTransformParams.x, 0.5f, 1.5f);
+    colorTransformParams.y = CLAMP(colorTransformParams.y, 0.5f, 1.5f);
+}
+
+// -------------------- Dynamic HDR10+ Metadata to Color Mapping --------------------
+static void ApplyHDR10PlusDynamicMetadata(
+    const HDR10PlusMetadata& hdr,
+    ColorEditingParams& edit)
+{
+    if (!hdr.isAvailable || hdr.data.size() < 10) {
+        return;
+    }
+
+    // EXPECTED HDR10+ STRUCTURE (simplified):
+    // data[0]  : targeted system luminance low (0–255)
+    // data[1]  : targeted system luminance high (0–255)
+    // data[2]  : maxCLL (0–255 scaled)
+    // data[3]  : maxFALL
+    // data[4]  : avgRGB saturation boost (signed, -128..127)
+    // data[5]  : tone-mapping knee point
+    // data[6]  : tone-mapping strength
+    // data[7]  : color warmth shift (signed)
+    // data[8]  : gamma modification
+    // data[9]  : scene contrast index
+
+    float lowLum   = hdr.data[0]  / 255.0f;
+    float highLum  = hdr.data[1]  / 255.0f;
+    float maxCLL   = hdr.data[2]  / 255.0f;
+    float maxFALL  = hdr.data[3]  / 255.0f;
+
+    int satBoost_i = (int8_t)hdr.data[4];
+    float satBoost = satBoost_i / 128.0f;
+
+    float kneePoint = hdr.data[5] / 255.0f;
+    float kneeStrength = hdr.data[6] / 255.0f;
+
+    int warmthShift_i = (int8_t)hdr.data[7];
+    float warmthShift = warmthShift_i / 128.0f;
+
+    float gammaMod = hdr.data[8] / 255.0f;
+
+    float sceneContrast = hdr.data[9] / 255.0f;
+
+    // ACTUAL COLOR EDITING ADJUSTMENTS
+
+    // Auto-brightness from luminance & FALL
+    edit.brightness += (highLum - lowLum) * 0.35f;
+    edit.brightness += maxFALL * 0.15f;
+
+    // Auto contrast from scene contrast + knee strength
+    edit.contrast *= (1.0f + sceneContrast * 0.40f + kneeStrength * 0.25f);
+
+    // Auto saturation
+    edit.saturation *= (1.0f + satBoost * 0.50f);
+
+    // Auto hue (warmth shift)
+    edit.hue += warmthShift * 10.0f;  // degrees
+
+    // Auto gamma correction
+    edit.gamma *= (1.0f + gammaMod * 0.30f);
+
+    // Safety clamp
+    edit.brightness = CLAMP(edit.brightness, -1.0f, 1.0f);
+    edit.contrast   = CLAMP(edit.contrast,   0.1f,  3.0f);
+    edit.saturation = CLAMP(edit.saturation, 0.1f,  3.0f);
+    edit.gamma      = CLAMP(edit.gamma,      0.5f,  3.0f);
+    // hue can be freeform
+}
+
+// -------------------- GDI Color Metrics Capture --------------------
+static float EstimateGamma(const WORD* lut)
+{
+    float x1 = 64.0f / 255.0f;
+    float x2 = 192.0f / 255.0f;
+
+    float y1 = lut[64] / 65535.0f;
+    float y2 = lut[192] / 65535.0f;
+
+    if (y1 <= 0 || y2 <= 0) return 1.0f;
+
+    float g1 = logf(y1) / logf(x1);
+    float g2 = logf(y2) / logf(x2);
+
+    float g = (g1 + g2) * 0.5f;
+
+    if (g < 0.5f || g > 5.0f) return 1.0f;
+    return g;
+}
+
+static GDIColorMetrics CaptureGDIColorMetrics()
+{
+    GDIColorMetrics m = {};
+
+    HDC hdc = GetDC(NULL);
+    if (!hdc) return m;
+
+    if (!GetDeviceGammaRamp(hdc, m.ramp)) {
+        ReleaseDC(NULL, hdc);
+        return m;
+    }
+
+    ReleaseDC(NULL, hdc);
+
+    // Gamma per channel
+    m.gammaR = EstimateGamma(m.ramp[0]);
+    m.gammaG = EstimateGamma(m.ramp[1]);
+    m.gammaB = EstimateGamma(m.ramp[2]);
+
+    // Brightness from ramp centroid
+    float rMid = m.ramp[0][128] / 65535.0f;
+    float gMid = m.ramp[1][128] / 65535.0f;
+    float bMid = m.ramp[2][128] / 65535.0f;
+
+    m.brightness = (rMid + gMid + bMid) / 3.0f;  // 0..1 normalized
+
+    // Contrast from slope of ramp (difference between end and start)
+    auto slope = [](const WORD* lut) {
+        float y0 = lut[16]  / 65535.0f;
+        float y1 = lut[240] / 65535.0f;
+        return (y1 - y0);  // 0..1 domain
+    };
+
+    float cR = slope(m.ramp[0]);
+    float cG = slope(m.ramp[1]);
+    float cB = slope(m.ramp[2]);
+
+    m.contrast = (cR + cG + cB) * 0.3333f;
+
+    // White-point deltas (RGB bias)
+    m.deltaR = rMid - (gMid + bMid) * 0.5f;
+    m.deltaG = gMid - (rMid + bMid) * 0.5f;
+    m.deltaB = bMid - (rMid + gMid) * 0.5f;
+
+    return m;
+}
+
 // -------------------- Priority --------------------
 static void set_high_priority(){
     SetPriorityClass(GetCurrentProcess(),REALTIME_PRIORITY_CLASS);
@@ -1069,6 +1271,12 @@ static void enhance_quality(std::vector<uint8_t>& bgra, int w, int h) {
     
     // Process HDR metadata
     processHDRMetadata(bgra);
+    
+    // Apply HDR10+ metadata to color editing parameters
+    ApplyHDR10PlusDynamicMetadata(hdrMetadata, colorEditingParams);
+    
+    // Analyze frame and adjust color parameters dynamically
+    analyzeFrameAndAdjustParams(bgra, w, h);
     
     // Apply color transformations
     applyColorTransform(bgra, w, h);
@@ -1153,15 +1361,6 @@ static std::vector<std::vector<uint8_t>> generateInterpolatedFrames(int targetW,
 }
 
 // -------------------- REAL-TIME CUDA COLOR OVERLAY --------------------
-
-// Live controls — tweak these live!
-static float GetBrightness() { return 1.25f; }
-static float GetGamma()      { return 2.2f;  }
-static float GetContrast()   { return 1.18f; }
-static float GetDeltaR()     { return 0.07f; }
-static float GetDeltaG()     { return 0.0f;  }
-static float GetDeltaB()     { return -0.04f; }
-
 static std::atomic<bool> g_overlayRunning{ true };
 static cudaGraphicsResource* g_cudaResource = nullptr;
 static ID3D11Texture2D* g_stagingTex = nullptr;
@@ -1238,13 +1437,13 @@ static void RunColorOverlay(ID3D11Device* device, ID3D11DeviceContext* context, 
         size_t numBytes = 0;
         cudaGraphicsResourceGetMappedPointer((void**)&devPtr, &numBytes, g_cudaResource);
 
-        // Launch kernel
-        float b = GetBrightness();
-        float g = GetGamma();
-        float c = GetContrast();
-        float dr = GetDeltaR(), dg = GetDeltaG(), db = GetDeltaB();
+        // Capture GDI color metrics
+        GDIColorMetrics metrics = CaptureGDIColorMetrics();
 
-        launchAdjustKernel(devPtr, w, h, b, g, c, dr, dg, db);
+        // Launch kernel with GDI metrics
+        launchAdjustKernel(devPtr, w, h, metrics.brightness, 
+                          (metrics.gammaR + metrics.gammaG + metrics.gammaB) / 3.0f, 
+                          metrics.contrast, metrics.deltaR, metrics.deltaG, metrics.deltaB);
         cudaDeviceSynchronize();
 
         cudaGraphicsUnmapResources(1, &g_cudaResource, 0);

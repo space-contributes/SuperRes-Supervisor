@@ -41,21 +41,50 @@
 #include "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.0/include/device_launch_parameters.h"
 #include "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.0/include/vector_types.h"
 
-// Define Color struct once, here (after includes, before any other code)
-struct Color { 
-    float r, g, b, a; 
-};
-
 // Custom min/max functions to avoid conflicts with CUDA
 #define MIN(a,b) ((a) < (b) ? (a) : (b))
 #define MAX(a,b) ((a) > (b) ? (a) : (b))
 #define CLAMP(val, min_val, max_val) ((val) < (min_val) ? (min_val) : ((val) > (max_val) ? (max_val) : (val)))
 
-// SINGLE MotionVector definition
+// =================================================================
+// == FIX 1: Define structs BEFORE using them in extern "C" block ==
+// =================================================================
+struct Color { 
+    float r, g, b, a; 
+};
+
 struct MotionVector {
     int x, y;
     float confidence;
 };
+
+// =================================================================
+// == FIX 2: Corrected and relocated extern "C" block ==
+// This declares the host-side wrapper functions, not the __global__ kernels.
+// It is placed AFTER the struct definitions so the compiler knows what 'Color' and 'MotionVector' are.
+// =================================================================
+extern "C" {
+    void launchMotionEstimationKernel(
+        const unsigned char* currentFrame,
+        const unsigned char* previousFrame,
+        int width, int height,
+        MotionVector* motionField,
+        int blockSize, int maxMotionVector);
+        
+    void launchUpscalingKernel(
+        const unsigned char* input,
+        unsigned char* output,
+        int inW, int inH, int outW, int outH,
+        float scaleX, float scaleY,
+        float sharpnessFactor,
+        float brightness, float contrast, float saturation, float hue, float gamma,
+        float w, float x, float y, float z, float eta,
+        float chromaStretch, float hueWarp, float lightnessFlow);
+        
+    void launchAdjustKernel(Color* pixels, int width, int height,
+        float brightness, float gamma, float contrast,
+        float deltaR, float deltaG, float deltaB);
+}
 
 // HDR10+ Metadata structure
 struct HDR10PlusMetadata {
@@ -208,31 +237,6 @@ static void cleanupCuda() {
     }
 }
 
-// -------------------- CUDA Kernels --------------------
-// Add these declarations in supervisor.cpp (after includes)
-extern "C" {
-    void motionEstimationKernel(
-        const unsigned char* currentFrame,
-        const unsigned char* previousFrame,
-        int width, int height,
-        MotionVector* motionField,
-        int blockSize, int maxMotionVector);
-        
-    void upscalingKernel(
-        const unsigned char* input,
-        unsigned char* output,
-        int inW, int inH, int outW, int outH,
-        float scaleX, float scaleY,
-        float sharpnessFactor,
-        float brightness, float contrast, float saturation, float hue, float gamma,
-        float w, float x, float y, float z, float eta,
-        float chromaStretch, float hueWarp, float lightnessFlow);
-        
-    void AdjustKernel(Color* pixels, int width, int height,
-        float brightness, float gamma, float contrast,
-        float deltaR, float deltaG, float deltaB);
-}
-
 // -------------------- Logging / dirs --------------------
 static void ensure_dirs() {
     // Using CreateDirectory instead of filesystem for compatibility
@@ -332,23 +336,12 @@ static void estimateMotion(FrameBuffer& current, FrameBuffer& previous) {
                        previous.width * previous.height * 4 * sizeof(unsigned char),
                        cudaMemcpyHostToDevice, cudaStream);
         
-        // Kernel launch
-        dim3 gridDim(blocksX, blocksY);
-        dim3 blockDim(1);
-        
-        void* kernelArgs[] = {
-            (void*)&d_currentFrame,
-            (void*)&d_previousFrame,
-            (void*)&current.width,
-            (void*)&current.height,
-            (void*)&d_motionField,
-            (void*)&MOTION_BLOCK_SIZE,
-            (void*)&MAX_MOTION_VECTOR
-        };
-        
-        cudaLaunchKernel((void*)motionEstimationKernel, gridDim, blockDim,
-                         kernelArgs, 0, cudaStream);
-        
+        // =================================================================
+        // == FIX 3: Corrected kernel call in estimateMotion ==
+        // The previous code was incorrectly calling launchUpscalingKernel here.
+        // =================================================================
+        launchMotionEstimationKernel(d_currentFrame, d_previousFrame, current.width, current.height, d_motionField, MOTION_BLOCK_SIZE, MAX_MOTION_VECTOR);
+
         cudaMemcpyAsync(current.motionField.data(), d_motionField,
                        blocksX * blocksY * sizeof(MotionVector),
                        cudaMemcpyDeviceToHost, cudaStream);
@@ -391,7 +384,7 @@ static void estimateMotion(FrameBuffer& current, FrameBuffer& previous) {
                                                   0.587f * previous.data[prevIdx+1] +
                                                   0.114f * previous.data[prevIdx+0];
                                     
-                                    error += fabs(currLum - prevLum);
+                                    error += fabsf(currLum - prevLum);
                                     samples++;
                                 }
                             }
@@ -500,37 +493,8 @@ static std::vector<uint8_t> upscaleFrame(const std::vector<uint8_t>& input, int 
                        cudaMemcpyHostToDevice, cudaStream);
         
         // Kernel launch
-        dim3 gridDim((outW + 15) / 16, (outH + 15) / 16);
-        dim3 blockDim(16, 16);
-        
-        void* kernelArgs[] = {
-            (void*)&d_currentFrame,
-            (void*)&d_upscaledFrame,
-            (void*)&inW,
-            (void*)&inH,
-            (void*)&outW,
-            (void*)&outH,
-            (void*)&scaleX,
-            (void*)&scaleY,
-            (void*)&upscalingModel.sharpnessFactor,
-            (void*)&colorEditingParams.brightness,
-            (void*)&colorEditingParams.contrast,
-            (void*)&colorEditingParams.saturation,
-            (void*)&colorEditingParams.hue,
-            (void*)&colorEditingParams.gamma,
-            (void*)&colorTransformParams.w,
-            (void*)&colorTransformParams.x,
-            (void*)&colorTransformParams.y,
-            (void*)&colorTransformParams.z,
-            (void*)&colorTransformParams.eta,
-            (void*)&colorTransformParams.chromaStretch,
-            (void*)&colorTransformParams.hueWarp,
-            (void*)&colorTransformParams.lightnessFlow
-        };
-        
-        cudaLaunchKernel((void*)upscalingKernel, gridDim, blockDim,
-                         kernelArgs, 0, cudaStream);
-        
+        launchUpscalingKernel(d_currentFrame, d_upscaledFrame, inW, inH, outW, outH, scaleX, scaleY, upscalingModel.sharpnessFactor, colorEditingParams.brightness, colorEditingParams.contrast, colorEditingParams.saturation, colorEditingParams.hue, colorEditingParams.gamma, colorTransformParams.w, colorTransformParams.x, colorTransformParams.y, colorTransformParams.z, colorTransformParams.eta, colorTransformParams.chromaStretch, colorTransformParams.hueWarp, colorTransformParams.lightnessFlow);
+
         cudaMemcpyAsync(output.data(), d_upscaledFrame,
                        outW * outH * 4 * sizeof(unsigned char),
                        cudaMemcpyDeviceToHost, cudaStream);
@@ -1280,8 +1244,7 @@ static void RunColorOverlay(ID3D11Device* device, ID3D11DeviceContext* context, 
         float c = GetContrast();
         float dr = GetDeltaR(), dg = GetDeltaG(), db = GetDeltaB();
 
-        void* kernelArgs[] = { &devPtr, &w, &h, &b, &g, &c, &dr, &dg, &db };
-        cudaLaunchKernel((void*)AdjustKernel, blocks, threads, kernelArgs, 0, cudaStream);
+        launchAdjustKernel(devPtr, w, h, b, g, c, dr, dg, db);
         cudaDeviceSynchronize();
 
         cudaGraphicsUnmapResources(1, &g_cudaResource, 0);

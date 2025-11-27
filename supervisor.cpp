@@ -5,7 +5,9 @@
 // Removed macro redefinitions since they're already defined on command line
 // #define WIN32_LEAN_AND_MEAN
 // #define NOMINMAX
-
+#include <initguid.h>
+#include <dxgi1_2.h>
+#include <d3d11.h>
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
@@ -38,6 +40,11 @@
 #include "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.0/include/cuda_d3d11_interop.h"
 #include "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.0/include/device_launch_parameters.h"
 #include "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.0/include/vector_types.h"
+
+// Define Color struct once, here (after includes, before any other code)
+struct Color { 
+    float r, g, b, a; 
+};
 
 // Custom min/max functions to avoid conflicts with CUDA
 #define MIN(a,b) ((a) < (b) ? (a) : (b))
@@ -202,188 +209,28 @@ static void cleanupCuda() {
 }
 
 // -------------------- CUDA Kernels --------------------
-// Motion estimation kernel
-__global__ void motionEstimationKernel(
-    const unsigned char* currentFrame,
-    const unsigned char* previousFrame,
-    int width, int height,
-    MotionVector* motionField,
-    int blockSize, int maxMotionVector)
-{
-    int blockIdxX = blockIdx.x;
-    int blockIdxY = blockIdx.y;
-    int blocksX = (width + blockSize - 1) / blockSize;
-    
-    int bestX = 0, bestY = 0;
-    float bestError = FLT_MAX;
-    
-    for (int dy = -maxMotionVector; dy <= maxMotionVector; dy += 2) {
-        for (int dx = -maxMotionVector; dx <= maxMotionVector; dx += 2) {
-            float error = 0.0f;
-            int samples = 0;
-            
-            for (int py = 0; py < blockSize; py += 2) {
-                for (int px = 0; px < blockSize; px += 2) {
-                    int currX = blockIdxX * blockSize + px;
-                    int currY = blockIdxY * blockSize + py;
-                    int prevX = currX + dx;
-                    int prevY = currY + dy;
-                    
-                    if (prevX >= 0 && prevX < width &&
-                        prevY >= 0 && prevY < height &&
-                        currX >= 0 && currX < width &&
-                        currY >= 0 && currY < height) {
-                        
-                        int currIdx = (currY * width + currX) * 4;
-                        int prevIdx = (prevY * width + prevX) * 4;
-                        
-                        float currLum = 0.299f * currentFrame[currIdx+2] +
-                                      0.587f * currentFrame[currIdx+1] +
-                                      0.114f * currentFrame[currIdx+0];
-                        float prevLum = 0.299f * previousFrame[prevIdx+2] +
-                                      0.587f * previousFrame[prevIdx+1] +
-                                      0.114f * previousFrame[prevIdx+0];
-                        
-                        error += fabsf(currLum - prevLum);
-                        samples++;
-                    }
-                }
-            }
-            
-            if (samples > 0) {
-                error /= samples;
-                if (error < bestError) {
-                    bestError = error;
-                    bestX = dx;
-                    bestY = dy;
-                }
-            }
-        }
-    }
-    
-    int blockIdx = blockIdxY * blocksX + blockIdxX;
-    MotionVector mv = {bestX, bestY, 1.0f - (bestError / 255.0f)};
-    motionField[blockIdx] = mv;
-}
-
-// Upscaling kernel with color transformation
-__global__ void upscalingKernel(
-    const unsigned char* input,
-    unsigned char* output,
-    int inW, int inH, int outW, int outH,
-    float scaleX, float scaleY,
-    float sharpnessFactor,
-    float brightness, float contrast, float saturation, float hue, float gamma,
-    float w, float x, float y, float z, float eta,
-    float chromaStretch, float hueWarp, float lightnessFlow)
-{
-    // Fixed variable names to avoid conflicts with function parameters
-    int px = blockIdx.x * blockDim.x + threadIdx.x;
-    int py = blockIdx.y * blockDim.y + threadIdx.y;
-    
-    if (px >= outW || py >= outH) return;
-    
-    float srcX = px * scaleX;
-    float srcY = py * scaleY;
-    
-    int x0 = (int)srcX;
-    int y0 = (int)srcY;
-    int x1 = MIN(x0 + 1, inW - 1);
-    int y1 = MIN(y0 + 1, inH - 1);
-    
-    float dx = srcX - x0;
-    float dy = srcY - y0;
-    
-    int outIdx = (py * outW + px) * 4;
-    
-    // Bilinear interpolation
-    float r = 0.0f, g = 0.0f, b = 0.0f;
-    for (int c = 0; c < 3; c++) {
-        float p00 = input[(y0 * inW + x0) * 4 + c];
-        float p01 = input[(y0 * inW + x1) * 4 + c];
-        float p10 = input[(y1 * inW + x0) * 4 + c];
-        float p11 = input[(y1 * inW + x1) * 4 + c];
+// Add these declarations in supervisor.cpp (after includes)
+extern "C" {
+    void motionEstimationKernel(
+        const unsigned char* currentFrame,
+        const unsigned char* previousFrame,
+        int width, int height,
+        MotionVector* motionField,
+        int blockSize, int maxMotionVector);
         
-        float interpolated = p00 * (1-dx) * (1-dy) +
-                            p01 * dx * (1-dy) +
-                            p10 * (1-dx) * dy +
-                            p11 * dx * dy;
+    void upscalingKernel(
+        const unsigned char* input,
+        unsigned char* output,
+        int inW, int inH, int outW, int outH,
+        float scaleX, float scaleY,
+        float sharpnessFactor,
+        float brightness, float contrast, float saturation, float hue, float gamma,
+        float w, float x, float y, float z, float eta,
+        float chromaStretch, float hueWarp, float lightnessFlow);
         
-        // Apply sharpening
-        if (px > 0 && px < outW-1 && py > 0 && py < outH-1) {
-            float center = interpolated;
-            float sum = 0;
-            for (int ky = -1; ky <= 1; ky++) {
-                for (int kx = -1; kx <= 1; kx++) {
-                    if (kx == 0 && ky == 0) continue;
-                    int nx = px + kx;
-                    int ny = py + ky;
-                    float nSrcX = nx * scaleX;
-                    float nSrcY = ny * scaleY;
-                    int nx0 = (int)nSrcX;
-                    int ny0 = (int)nSrcY;
-                    int nx1 = MIN(nx0 + 1, inW - 1);
-                    int ny1 = MIN(ny0 + 1, inH - 1);
-                    float ndx = nSrcX - nx0;
-                    float ndy = nSrcY - ny0;
-                    
-                    float neighbor = input[(ny0 * inW + nx0) * 4 + c] * (1-ndx) * (1-ndy) +
-                                   input[(ny0 * inW + nx1) * 4 + c] * ndx * (1-ndy) +
-                                   input[(ny1 * inW + nx0) * 4 + c] * (1-ndx) * ndy +
-                                   input[(ny1 * inW + nx1) * 4 + c] * ndx * ndy;
-                    sum += neighbor;
-                }
-            }
-            sum /= 8.0f;
-            float detail = center - sum;
-            interpolated = center + detail * sharpnessFactor * 0.1f;
-        }
-        
-        if (c == 0) r = interpolated;
-        else if (c == 1) g = interpolated;
-        else b = interpolated;
-    }
-    
-    // Convert to normalized values
-    r /= 255.0f;
-    g /= 255.0f;
-    b /= 255.0f;
-    
-    // Apply color space transformations (simplified)
-    float combined = w * r + x * g + y * b + z * (r + g + b) / 3.0f + eta;
-    r = r * (1.0f - chromaStretch) + combined * chromaStretch;
-    g = g * (1.0f - chromaStretch) + combined * chromaStretch;
-    b = b * (1.0f - chromaStretch) + combined * chromaStretch;
-    
-    // Apply hue rotation
-    float h = atan2f(sqrtf(3.0f) * (g - b), 2.0f * r - g - b) + hue;
-    float s = sqrtf((r - g) * (r - g) + (g - b) * (g - b) + (b - r) * (b - r)) / sqrtf(2.0f);
-    float l = (r + g + b) / 3.0f;
-    
-    r = l + s * cosf(h);
-    g = l + s * cosf(h - 2.0f * 3.14159f / 3.0f);
-    b = l + s * cosf(h + 2.0f * 3.14159f / 3.0f);
-    
-    // Apply brightness, contrast, saturation
-    r = (r - 0.5f) * contrast + 0.5f + brightness;
-    g = (g - 0.5f) * contrast + 0.5f + brightness;
-    b = (b - 0.5f) * contrast + 0.5f + brightness;
-    
-    float gray = 0.299f * r + 0.587f * g + 0.114f * b;
-    r = gray + saturation * (r - gray);
-    g = gray + saturation * (g - gray);
-    b = gray + saturation * (b - gray);
-    
-    // Apply gamma correction
-    r = powf(r, 1.0f / gamma);
-    g = powf(g, 1.0f / gamma);
-    b = powf(b, 1.0f / gamma);
-    
-    // Convert back to 8-bit values
-    output[outIdx + 0] = (unsigned char)CLAMP(b * 255.0f, 0.0f, 255.0f);
-    output[outIdx + 1] = (unsigned char)CLAMP(g * 255.0f, 0.0f, 255.0f);
-    output[outIdx + 2] = (unsigned char)CLAMP(r * 255.0f, 0.0f, 255.0f);
-    output[outIdx + 3] = 255;
+    void AdjustKernel(Color* pixels, int width, int height,
+        float brightness, float gamma, float contrast,
+        float deltaR, float deltaG, float deltaB);
 }
 
 // -------------------- Logging / dirs --------------------
@@ -1222,8 +1069,6 @@ static void applyColorTransform(std::vector<uint8_t>& frame, int w, int h) {
     }
 }
 
-
-
 // -------------------- Priority --------------------
 static void set_high_priority(){
     SetPriorityClass(GetCurrentProcess(),REALTIME_PRIORITY_CLASS);
@@ -1343,108 +1188,9 @@ static std::vector<std::vector<uint8_t>> generateInterpolatedFrames(int targetW,
     return generateMultipleInterpolatedFrames(f1, f2, targetW, targetH, MAX_INTERPOLATIONS_PER_FRAME);
 }
 
-// -------------------- Main with Enhanced Processing --------------------
-int main() {
-    initCuda();
-    
-    ensure_dirs();
-    set_high_priority();
-    
-    DDAContext ddaCtx;
-    init_dda(ddaCtx);
-    DCompContext dcompCtx;
-    init_dcomp(dcompCtx, TARGET_W_DEFAULT, TARGET_H_DEFAULT);
-    
-    if (cudaInitialized) {
-        allocateCudaMemory(TARGET_W_DEFAULT, TARGET_H_DEFAULT);
-    }
-    
-    // Load color transformation parameters
-    upscalingModel.load(std::string(MODULES_DIR) + "/upscaling_model.bin");
-    
-    std::vector<uint8_t> frame;
-    int w, h;
-    int frameCount = 0;
-    bool running = true;
-    
-    auto lastFrameTime = std::chrono::steady_clock::now();
-    auto frameInterval = std::chrono::milliseconds(1000 / TARGET_HZ);
-    
-    // Color editing controls (simplified for demonstration)
-    bool showColorControls = false;
-    
-    while(running) {
-        auto currentTime = std::chrono::steady_clock::now();
-        
-        bool got = false;
-        if(ddaCtx.initialized) got = grab_frame_dda(ddaCtx, frame, w, h);
-        if(!got) got = grab_frame_gdi(frame, w, h);
-        
-        if(got) {
-            processFrameWithVerification(frame, w, h);
-            
-            frameDataHistory.push_back(frame);
-            if (frameDataHistory.size() > 3) {
-                frameDataHistory.erase(frameDataHistory.begin());
-            }
-            
-            present_via_dcomp(dcompCtx, frame, TARGET_W_DEFAULT, TARGET_H_DEFAULT);
-            
-            frameCount++;
-            
-            // Generate and display interpolated frames
-            a            // Generate and display interpolated frames
-            auto interpolatedFrames = generateInterpolatedFrames(TARGET_W_DEFAULT, TARGET_H_DEFAULT);
-            for (const auto& interpolatedFrame : interpolatedFrames) {
-                present_via_dcomp(dcompCtx, interpolatedFrame, TARGET_W_DEFAULT, TARGET_H_DEFAULT);
-                frameCount++;
-            }
+// -------------------- REAL-TIME CUDA COLOR OVERLAY --------------------
 
-            // ESC to exit
-            if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
-                running = false;
-            }
-
-            // Save model every 300 frames
-            if (frameCount % 300 == 0) {
-                upscalingModel.save(std::string(MODULES_DIR) + "/upscaling_model.bin");
-            }
-
-            sleep_until(lastFrameTime + frameInterval);
-            lastFrameTime = std::chrono::steady_clock::now();
-        }
-    }
-
-    // Final save
-    upscalingModel.save(std::string(MODULES_DIR) + "/upscaling_model.bin");
-
-    freeCudaMemory();
-    cleanupCuda();
-
-    return 0;
-}
-// ——————————————————————————————————————————————
-// REAL-TIME CUDA COLOR OVERLAY (AdjustKernel) — runs forever in background
-// ——————————————————————————————————————————————
-struct Color { float r, g, b, a; };
-
-__global__ void AdjustKernel(Color* pixels, int width, int height,
-                            float brightness, float gamma, float contrast,
-                            float deltaR, float deltaG, float deltaB)
-{
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= width || y >= height) return;
-    int idx = y * width + x;
-    Color c = pixels[idx];
-    float invGamma = 1.0f / gamma;
-    c.r = fminf(fmaxf(powf(c.r * brightness, invGamma) * contrast + deltaR, 0.0f), 1.0f);
-    c.g = fminf(fmaxf(powf(c.g * brightness, invGamma) * contrast + deltaG, 0.0f), 1.0f);
-    c.b = fminf(fmaxf(powf(c.b * brightness, invGamma) * contrast + deltaB, 0.0f), 1.0f);
-    pixels[idx] = c;
-}
-
-// Live controls — change these at runtime for instant effect
+// Live controls — tweak these live!
 static float GetBrightness() { return 1.25f; }
 static float GetGamma()      { return 2.2f;  }
 static float GetContrast()   { return 1.18f; }
@@ -1460,61 +1206,97 @@ static void RunColorOverlay(ID3D11Device* device, ID3D11DeviceContext* context, 
 {
     if (!device || !output1) return;
 
-    ComPtr<IDXGIOutputDuplication> dupl;
-    if (FAILED(output1->DuplicateOutput(device, &dupl))) return;
+    IDXGIOutputDuplication* duplRaw = nullptr;
+    HRESULT hr = output1->DuplicateOutput(device, &duplRaw);
+    if (FAILED(hr)) {
+        printf("DuplicateOutput failed: 0x%X\n", hr);
+        return;
+    }
+    ComPtr<IDXGIOutputDuplication> dupl(duplRaw);
 
-    DXGI_OUTPUT_DESC desc;
-    output1->GetDesc(&desc);
-    int w = desc.DesktopCoordinates.right - desc.DesktopCoordinates.left;
-    int h = desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top;
+    DXGI_OUTPUT_DESC outDesc{};
+    output1->GetDesc(&outDesc);
+    int w = outDesc.DesktopCoordinates.right - outDesc.DesktopCoordinates.left;
+    int h = outDesc.DesktopCoordinates.bottom - outDesc.DesktopCoordinates.top;
 
     D3D11_TEXTURE2D_DESC texDesc{};
-    texDesc.Width = w; texDesc.Height = h;
-    texDesc.MipLevels = texDesc.ArraySize = 1;
+    texDesc.Width = w;
+    texDesc.Height = h;
+    texDesc.MipLevels = 1;
+    texDesc.ArraySize = 1;
     texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    si::SampleDesc.Count = 1;
+    texDesc.SampleDesc.Count = 1;
     texDesc.Usage = D3D11_USAGE_DEFAULT;
     texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    texDesc.CPUAccessFlags = 0;
 
-    if (FAILED(device->CreateTexture2D(&texDesc, nullptr, &g_stagingTex))) return;
-    cudaGraphicsD3D11RegisterResource(&g_cudaResource, g_stagingTex, cudaGraphicsRegisterFlagsSurfaceLoadStore);
+    if (FAILED(device->CreateTexture2D(&texDesc, nullptr, &g_stagingTex))) {
+        printf("Failed to create staging texture\n");
+        return;
+    }
+
+    cudaError_t cuErr = cudaGraphicsD3D11RegisterResource(&g_cudaResource, g_stagingTex,
+        cudaGraphicsRegisterFlagsSurfaceLoadStore);
+    if (cuErr != cudaSuccess) {
+        printf("CUDA register failed: %s\n", cudaGetErrorString(cuErr));
+        return;
+    }
 
     dim3 threads(16, 16);
-    dim3 blocks((w + 15)/16, (h + 15)/16);
+    dim3 blocks((w + 15) / 16, (h + 15) / 16);
 
     while (g_overlayRunning.load())
     {
-        DXGI_OUTDUPL_FRAME_INFO info;
-        ComPtr<IDXGIResource> res;
-        HRESULT hr = dupl->AcquireNextFrame(100, &info, &res);
-        if (hr == DXGI_ERROR_WAIT_TIMEOUT) { std::this_thread::yield(); continue; }
-        if (FAILED(hr)) break;
+        DXGI_OUTDUPL_FRAME_INFO frameInfo{};
+        IDXGIResource* desktopResource = nullptr;
 
-        ComPtr<ID3D11Texture2D> frame;
-        res->QueryInterface(IID_PPV_ARGS(&frame));
-        context->CopyResource(g_stagingTex, frame.Get());
+        hr = dupl->AcquireNextFrame(100, &frameInfo, &desktopResource);
+        if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            continue;
+        }
+        if (FAILED(hr)) {
+            if (hr == DXGI_ERROR_ACCESS_LOST) break;
+            continue;
+        }
+
+        ID3D11Texture2D* frameTexRaw = nullptr;
+        desktopResource->QueryInterface(IID_ID3D11Texture2D, (void**)&frameTexRaw);
+        ComPtr<ID3D11Texture2D> frameTex(frameTexRaw);
+        desktopResource->Release();
+
+        context->CopyResource(g_stagingTex, frameTex.Get());
         dupl->ReleaseFrame();
 
+        // Map CUDA resource
         cudaGraphicsMapResources(1, &g_cudaResource, 0);
         Color* devPtr = nullptr;
-        size_t size = 0;
-        cudaGraphicsResourceGetMappedPointer((void**)&devPtr, &size, g_cudaResource);
+        size_t numBytes = 0;
+        cudaGraphicsResourceGetMappedPointer((void**)&devPtr, &numBytes, g_cudaResource);
 
-        float b = GetBrightness(), g = GetGamma(), c = GetContrast();
+        // Launch kernel
+        float b = GetBrightness();
+        float g = GetGamma();
+        float c = GetContrast();
         float dr = GetDeltaR(), dg = GetDeltaG(), db = GetDeltaB();
 
-        AdjustKernel<<<blocks, threads>>>(devPtr, w, h, b, g, c, dr, dg, db);
+        void* kernelArgs[] = { &devPtr, &w, &h, &b, &g, &c, &dr, &dg, &db };
+        cudaLaunchKernel((void*)AdjustKernel, blocks, threads, kernelArgs, 0, cudaStream);
         cudaDeviceSynchronize();
+
         cudaGraphicsUnmapResources(1, &g_cudaResource, 0);
     }
 
+    // Cleanup
     if (g_cudaResource) cudaGraphicsUnregisterResource(g_cudaResource);
-    if (g_stagingTex) { g_stagingTex->Release(); g_stagingTex = nullptr; }
+    g_cudaResource = nullptr;
+    if (g_stagingTex) {
+        g_stagingTex->Release();
+        g_stagingTex = nullptr;
+    }
 }
 
-// ——————————————————————————————————————————————
-// MAIN SUPERVISOR LOOP + CLEANUP IN ONE FUNCTION
-// ——————————————————————————————————————————————
+// -------------------- MAIN SUPERVISOR LOOP + CLEANUP IN ONE FUNCTION --------------------
 static void RunSupervisor()
 {
     DDAContext ddaCtx;
@@ -1592,9 +1374,7 @@ static void RunSupervisor()
     printf("Supervisor shutdown complete.\n");
 }
 
-// ——————————————————————————————————————————————
-// MAIN — short and beautiful
-// ——————————————————————————————————————————————
+// -------------------- MAIN — short and beautiful --------------------
 int main()
 {
     CoInitialize(nullptr);

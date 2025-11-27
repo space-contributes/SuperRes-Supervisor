@@ -1087,60 +1087,50 @@ static bool present_via_dcomp(DCompContext &ctx, const std::vector<uint8_t>& bgr
     
     // Update surface with new frame data
     RECT updateRect = {0, 0, w, h};
-POINT updateOffset;
-IDXGISurface* rawSurface = nullptr;
+    POINT updateOffset;
+    IDXGISurface* rawSurface = nullptr;
+    HRESULT hr = ctx.dcompSurface->BeginDraw(&updateRect, IID_PPV_ARGS(&rawSurface), &updateOffset);
+    if (FAILED(hr) || !rawSurface) return false;
 
-HRESULT BeginDraw(
-  [in, optional] const RECT *updateRect,
-  [in] REFIID iid,
-  [out] void **interface
-);
+    ComPtr<IDXGISurface> surface(rawSurface);
 
-if (FAILED(hr) || !rawSurface) return false;
-
-// Use ComPtr for resource safety
-ComPtr<IDXGISurface> surface(rawSurface);
-
-// ... use surface as needed below ...
-    
-ComPtr<ID3D11Texture2D> texture;
-hr = surface->QueryInterface(__uuidof(ID3D11Texture2D), 
-                            reinterpret_cast<void**>(texture.GetAddressOf()));
-if (FAILED(hr) || !texture) {
+    ComPtr<ID3D11Texture2D> texture;
+    hr = surface->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(texture.GetAddressOf()));
+    if (FAILED(hr) || !texture) {
         ctx.dcompSurface->EndDraw();
         return false;
     }
-    
+
     D3D11_TEXTURE2D_DESC desc;
     texture->GetDesc(&desc);
-    
+
     D3D11_MAPPED_SUBRESOURCE mapped;
     hr = ctx.d3dContext->Map(texture.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
     if (FAILED(hr)) {
         ctx.dcompSurface->EndDraw();
         return false;
     }
-    
+
     // Copy frame data to texture
     uint8_t* dest = static_cast<uint8_t*>(mapped.pData);
     const uint8_t* src = bgra.data();
-    
+
     for (int y = 0; y < h; y++) {
         memcpy(dest + y * mapped.RowPitch, src + y * w * 4, w * 4);
     }
-    
+
     ctx.d3dContext->Unmap(texture.Get(), 0);
-    
+
     hr = ctx.dcompSurface->EndDraw();
     if (FAILED(hr)) return false;
-    
+
     // Set the surface as content for the visual
     ctx.dcompVisual->SetContent(ctx.dcompSurface.Get());
-    
+
     // Commit changes
     hr = ctx.dcompDevice->Commit();
     if (FAILED(hr)) return false;
-    
+
     return true;
 }
 

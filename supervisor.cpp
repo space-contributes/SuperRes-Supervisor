@@ -32,14 +32,17 @@
 #include <comdef.h>
 #include <dwmapi.h>
 #include <shellscalingapi.h>
+
 // CUDA headers with full paths
 #include "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.0/include/cuda_runtime.h"
 #include "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.0/include/cuda_d3d11_interop.h"
 #include "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.0/include/device_launch_parameters.h"
 #include "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.0/include/vector_types.h"
 
-// Use filesystem alias to avoid namespace issues
-
+// Custom min/max functions to avoid conflicts with CUDA
+#define MIN(a,b) ((a) < (b) ? (a) : (b))
+#define MAX(a,b) ((a) > (b) ? (a) : (b))
+#define CLAMP(val, min_val, max_val) ((val) < (min_val) ? (min_val) : ((val) > (max_val) ? (max_val) : (val)))
 
 // SINGLE MotionVector definition
 struct MotionVector {
@@ -119,6 +122,9 @@ static const int MAX_INTERPOLATIONS_PER_FRAME = 3;  // New parameter for multipl
 static ColorTransformParams colorTransformParams;
 static ColorEditingParams colorEditingParams;
 static HDR10PlusMetadata hdrMetadata;
+
+// Frame data history - moved here to fix undeclared identifier errors
+static std::vector<std::vector<uint8_t>> frameDataHistory;
 
 // -------------------- RAII Wrappers for DirectX Resources --------------------
 template<typename T>
@@ -271,23 +277,24 @@ __global__ void upscalingKernel(
     float w, float x, float y, float z, float eta,
     float chromaStretch, float hueWarp, float lightnessFlow)
 {
+    // Fixed variable names to avoid conflicts with function parameters
     int px = blockIdx.x * blockDim.x + threadIdx.x;
     int py = blockIdx.y * blockDim.y + threadIdx.y;
     
-    if (x >= outW || y >= outH) return;
+    if (px >= outW || py >= outH) return;
     
-    float srcX = x * scaleX;
-    float srcY = y * scaleY;
+    float srcX = px * scaleX;
+    float srcY = py * scaleY;
     
     int x0 = (int)srcX;
     int y0 = (int)srcY;
-    int x1 = fminf(x0 + 1, inW - 1);
-    int y1 = fminf(y0 + 1, inH - 1);
+    int x1 = MIN(x0 + 1, inW - 1);
+    int y1 = MIN(y0 + 1, inH - 1);
     
     float dx = srcX - x0;
     float dy = srcY - y0;
     
-    int outIdx = (y * outW + x) * 4;
+    int outIdx = (py * outW + px) * 4;
     
     // Bilinear interpolation
     float r = 0.0f, g = 0.0f, b = 0.0f;
@@ -303,20 +310,20 @@ __global__ void upscalingKernel(
                             p11 * dx * dy;
         
         // Apply sharpening
-        if (x > 0 && x < outW-1 && y > 0 && y < outH-1) {
+        if (px > 0 && px < outW-1 && py > 0 && py < outH-1) {
             float center = interpolated;
             float sum = 0;
             for (int ky = -1; ky <= 1; ky++) {
                 for (int kx = -1; kx <= 1; kx++) {
                     if (kx == 0 && ky == 0) continue;
-                    int nx = x + kx;
-                    int ny = y + ky;
+                    int nx = px + kx;
+                    int ny = py + ky;
                     float nSrcX = nx * scaleX;
                     float nSrcY = ny * scaleY;
                     int nx0 = (int)nSrcX;
                     int ny0 = (int)nSrcY;
-                    int nx1 = fminf(nx0 + 1, inW - 1);
-                    int ny1 = fminf(ny0 + 1, inH - 1);
+                    int nx1 = MIN(nx0 + 1, inW - 1);
+                    int ny1 = MIN(ny0 + 1, inH - 1);
                     float ndx = nSrcX - nx0;
                     float ndy = nSrcY - ny0;
                     
@@ -373,9 +380,9 @@ __global__ void upscalingKernel(
     b = powf(b, 1.0f / gamma);
     
     // Convert back to 8-bit values
-    output[outIdx + 0] = (unsigned char)fminf(fmaxf(b * 255.0f, 0.0f), 255.0f);
-    output[outIdx + 1] = (unsigned char)fminf(fmaxf(g * 255.0f, 0.0f), 255.0f);
-    output[outIdx + 2] = (unsigned char)fminf(fmaxf(r * 255.0f, 0.0f), 255.0f);
+    output[outIdx + 0] = (unsigned char)CLAMP(b * 255.0f, 0.0f, 255.0f);
+    output[outIdx + 1] = (unsigned char)CLAMP(g * 255.0f, 0.0f, 255.0f);
+    output[outIdx + 2] = (unsigned char)CLAMP(r * 255.0f, 0.0f, 255.0f);
     output[outIdx + 3] = 255;
 }
 
@@ -604,9 +611,9 @@ struct UpscalingModel {
         if (samples > 0) {
             avgEdgeStrength /= samples;
             if (avgEdgeStrength < adaptiveThreshold) {
-                sharpnessFactor = std::min(sharpnessFactor * 1.01f, 3.0f);
+                sharpnessFactor = MIN(sharpnessFactor * 1.01f, 3.0f);
             } else {
-                sharpnessFactor = std::max(sharpnessFactor * 0.99f, 1.2f);
+                sharpnessFactor = MAX(sharpnessFactor * 0.99f, 1.2f);
             }
         }
     }
@@ -691,8 +698,8 @@ static std::vector<uint8_t> upscaleFrame(const std::vector<uint8_t>& input, int 
                 
                 int x0 = (int)srcX;
                 int y0 = (int)srcY;
-                int x1 = (int)fminf(x0 + 1, inW - 1);
-                int y1 = (int)fminf(y0 + 1, inH - 1);
+                int x1 = MIN(x0 + 1, inW - 1);
+                int y1 = MIN(y0 + 1, inH - 1);
                 
                 float dx = srcX - x0;
                 float dy = srcY - y0;
@@ -722,8 +729,8 @@ static std::vector<uint8_t> upscaleFrame(const std::vector<uint8_t>& input, int 
                                 float nSrcY = ny * scaleY;
                                 int nx0 = (int)nSrcX;
                                 int ny0 = (int)nSrcY;
-                                int nx1 = std::min(nx0 + 1, inW - 1);
-                                int ny1 = std::min(ny0 + 1, inH - 1);
+                                int nx1 = MIN(nx0 + 1, inW - 1);
+                                int ny1 = MIN(ny0 + 1, inH - 1);
                                 float ndx = nSrcX - nx0;
                                 float ndy = nSrcY - ny0;
                                 
@@ -740,7 +747,7 @@ static std::vector<uint8_t> upscaleFrame(const std::vector<uint8_t>& input, int 
                     }
                     
                     // Using custom clamp function instead of std::clamp
-                    output[outIdx + c] = (uint8_t)(interpolated < 0.0f ? 0.0f : (interpolated > 255.0f ? 255.0f : interpolated));
+                    output[outIdx + c] = (uint8_t)CLAMP(interpolated, 0.0f, 255.0f);
                 }
                 output[outIdx + 3] = 255;
             }
@@ -816,8 +823,8 @@ static std::vector<std::vector<uint8_t>> generateMultipleInterpolatedFrames(
     if (motionVectors > 0) avgMotion /= motionVectors;
     
     // Adjust number of interpolations based on motion
-    int adjustedInterpolations = std::min(numInterpolations, 
-                                        std::max(1, (int)(avgMotion / 5.0f)));
+    int adjustedInterpolations = MIN(numInterpolations, 
+                                  MAX(1, (int)(avgMotion / 5.0f)));
     
     // Generate interpolated frames
     for (int i = 1; i <= adjustedInterpolations; i++) {
@@ -1089,7 +1096,9 @@ static bool present_via_dcomp(DCompContext &ctx, const std::vector<uint8_t>& bgr
     RECT updateRect = {0, 0, w, h};
     POINT updateOffset;
     IDXGISurface* rawSurface = nullptr;
-    HRESULT hr = ctx.dcompSurface->BeginDraw(&updateRect, IID_PPV_ARGS(&rawSurface), &updateOffset);
+    
+    // Fixed IID_PPV_ARGS usage
+    HRESULT hr = ctx.dcompSurface->BeginDraw(&updateRect, IID_IDXGISurface, (void**)&rawSurface, &updateOffset);
     if (FAILED(hr) || !rawSurface) return false;
 
     ComPtr<IDXGISurface> surface(rawSurface);
@@ -1206,9 +1215,9 @@ static void applyColorTransform(std::vector<uint8_t>& frame, int w, int h) {
             b = powf(b, 1.0f / colorEditingParams.gamma);
             
             // Using custom clamp instead of std::clamp
-            frame[idx + 0] = (uint8_t)(b * 255.0f < 0.0f ? 0.0f : (b * 255.0f > 255.0f ? 255.0f : b * 255.0f));
-            frame[idx + 1] = (uint8_t)(g * 255.0f < 0.0f ? 0.0f : (g * 255.0f > 255.0f ? 255.0f : g * 255.0f));
-            frame[idx + 2] = (uint8_t)(r * 255.0f < 0.0f ? 0.0f : (r * 255.0f > 255.0f ? 255.0f : r * 255.0f));
+            frame[idx + 0] = (uint8_t)CLAMP(b * 255.0f, 0.0f, 255.0f);
+            frame[idx + 1] = (uint8_t)CLAMP(g * 255.0f, 0.0f, 255.0f);
+            frame[idx + 2] = (uint8_t)CLAMP(r * 255.0f, 0.0f, 255.0f);
         }
     }
 }
@@ -1268,7 +1277,7 @@ static void enhance_quality(std::vector<uint8_t>& bgra, int w, int h) {
                     const MotionVector& mv = currentFrame.motionField[blockIdx];
                     float motionStrength = sqrt(mv.x * mv.x + mv.y * mv.y);
                     
-                    float filterStrength = std::max(0.1f, 1.0f - motionStrength / MAX_MOTION_VECTOR);
+                    float filterStrength = MAX(0.1f, 1.0f - motionStrength / MAX_MOTION_VECTOR);
                     
                     if (motionStrength < 5.0f) {
                         int prevIdx = idx;
@@ -1301,7 +1310,7 @@ static void processFrameWithVerification(std::vector<uint8_t>& bgra, int w, int 
     int changedPixels = 0;
     int totalDiff = 0;
     
-    for (int i = 0; i < std::min(before.size(), bgra.size()); i += 4) {
+    for (int i = 0; i < MIN(before.size(), bgra.size()); i += 4) {
         int diff = abs(before[i] - bgra[i]) + abs(before[i+1] - bgra[i+1]) + abs(before[i+2] - bgra[i+2]);
         if (diff > 10) {
             changedPixels++;
@@ -1311,8 +1320,6 @@ static void processFrameWithVerification(std::vector<uint8_t>& bgra, int w, int 
 }
 
 // -------------------- Frame Rate Management --------------------
-static std::vector<std::vector<uint8_t>> frameDataHistory;
-
 static std::vector<std::vector<uint8_t>> generateInterpolatedFrames(int targetW, int targetH) {
     if (frameDataHistory.size() < 2) {
         return {std::vector<uint8_t>(targetW * targetH * 4, 0)};
@@ -1393,27 +1400,27 @@ int main() {
             // Adjust color parameters based on user input (simplified)
             if (GetAsyncKeyState(VK_F1) & 0x8000) {
                 colorEditingParams.brightness += 0.05f;
-                colorEditingParams.brightness = std::min(colorEditingParams.brightness, 1.0f);
+                colorEditingParams.brightness = MIN(colorEditingParams.brightness, 1.0f);
             }
             if (GetAsyncKeyState(VK_F2) & 0x8000) {
                 colorEditingParams.brightness -= 0.05f;
-                colorEditingParams.brightness = std::max(colorEditingParams.brightness, -1.0f);
+                colorEditingParams.brightness = MAX(colorEditingParams.brightness, -1.0f);
             }
             if (GetAsyncKeyState(VK_F3) & 0x8000) {
                 colorEditingParams.contrast += 0.1f;
-                colorEditingParams.contrast = std::min(colorEditingParams.contrast, 3.0f);
+                colorEditingParams.contrast = MIN(colorEditingParams.contrast, 3.0f);
             }
             if (GetAsyncKeyState(VK_F4) & 0x8000) {
                 colorEditingParams.contrast -= 0.1f;
-                colorEditingParams.contrast = std::max(colorEditingParams.contrast, 0.1f);
+                colorEditingParams.contrast = MAX(colorEditingParams.contrast, 0.1f);
             }
             if (GetAsyncKeyState(VK_F5) & 0x8000) {
                 colorEditingParams.saturation += 0.1f;
-                colorEditingParams.saturation = std::min(colorEditingParams.saturation, 3.0f);
+                colorEditingParams.saturation = MIN(colorEditingParams.saturation, 3.0f);
             }
             if (GetAsyncKeyState(VK_F6) & 0x8000) {
                 colorEditingParams.saturation -= 0.1f;
-                colorEditingParams.saturation = std::max(colorEditingParams.saturation, 0.0f);
+                colorEditingParams.saturation = MAX(colorEditingParams.saturation, 0.0f);
             }
             if (GetAsyncKeyState(VK_F7) & 0x8000) {
                 colorEditingParams.hue += 0.1f;
@@ -1423,11 +1430,11 @@ int main() {
             }
             if (GetAsyncKeyState(VK_F9) & 0x8000) {
                 colorEditingParams.gamma += 0.1f;
-                colorEditingParams.gamma = std::min(colorEditingParams.gamma, 3.0f);
+                colorEditingParams.gamma = MIN(colorEditingParams.gamma, 3.0f);
             }
             if (GetAsyncKeyState(VK_F10) & 0x8000) {
                 colorEditingParams.gamma -= 0.1f;
-                colorEditingParams.gamma = std::max(colorEditingParams.gamma, 0.1f);
+                colorEditingParams.gamma = MAX(colorEditingParams.gamma, 0.1f);
             }
             
             if(frameCount % 60 == 0) {

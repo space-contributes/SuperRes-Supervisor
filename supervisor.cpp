@@ -16,7 +16,6 @@
 #include <chrono>
 #include <thread>
 #include <iostream>
-#include <filesystem>
 #include <fstream>
 #include <vector>
 #include <algorithm>  // Added for min and clamp functions
@@ -33,7 +32,7 @@
 #include <comdef.h>
 #include <dwmapi.h>
 #include <shellscalingapi.h>
-
+set(CMAKE_CXX_STANDARD 17)
 // CUDA headers with full paths
 #include "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.0/include/cuda_runtime.h"
 #include "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.0/include/cuda_d3d11_interop.h"
@@ -41,7 +40,7 @@
 #include "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.0/include/vector_types.h"
 
 // Use filesystem alias to avoid namespace issues
-namespace fs = std::filesystem;
+
 
 // SINGLE MotionVector definition
 struct MotionVector {
@@ -273,8 +272,8 @@ __global__ void upscalingKernel(
     float w, float x, float y, float z, float eta,
     float chromaStretch, float hueWarp, float lightnessFlow)
 {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int px = blockIdx.x * blockDim.x + threadIdx.x;
+    int py = blockIdx.y * blockDim.y + threadIdx.y;
     
     if (x >= outW || y >= outH) return;
     
@@ -693,8 +692,8 @@ static std::vector<uint8_t> upscaleFrame(const std::vector<uint8_t>& input, int 
                 
                 int x0 = (int)srcX;
                 int y0 = (int)srcY;
-                int x1 = std::min(x0 + 1, inW - 1);
-                int y1 = std::min(y0 + 1, inH - 1);
+                int x1 = (int)fminf(x0 + 1, inW - 1);
+                int y1 = (int)fminf(y0 + 1, inH - 1);
                 
                 float dx = srcX - x0;
                 float dy = srcY - y0;
@@ -1088,13 +1087,23 @@ static bool present_via_dcomp(DCompContext &ctx, const std::vector<uint8_t>& bgr
     if (!ctx.initialized) return false;
     
     // Update surface with new frame data
-    POINT updateOffset;
     RECT updateRect = {0, 0, w, h};
-    ComPtr<IDXGISurface> surface;
-    
-    // Fixed BeginDraw call
-    HRESULT hr = ctx.dcompSurface->BeginDraw(&updateRect, IID_PPV_ARGS(&surface), &updateOffset);
-    if (FAILED(hr) || !surface) return false;
+POINT updateOffset;
+IDXGISurface* rawSurface = nullptr;
+
+HRESULT hr = ctx.dcompSurface->BeginDraw(
+    &updateRect,
+    __uuidof(IDXGISurface),
+    (void**)&rawSurface,
+    &updateOffset
+);
+
+if (FAILED(hr) || !rawSurface) return false;
+
+// Use ComPtr for resource safety
+ComPtr<IDXGISurface> surface(rawSurface);
+
+// ... use surface as needed below ...
     
     ComPtr<ID3D11Texture2D> texture;
     hr = surface->QueryInterface(__uuidof(ID3D11Texture2D), 

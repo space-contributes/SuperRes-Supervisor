@@ -32,7 +32,6 @@
 #include <comdef.h>
 #include <dwmapi.h>
 #include <shellscalingapi.h>
-set(CMAKE_CXX_STANDARD 17)
 // CUDA headers with full paths
 #include "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.0/include/cuda_runtime.h"
 #include "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.0/include/cuda_d3d11_interop.h"
@@ -282,8 +281,8 @@ __global__ void upscalingKernel(
     
     int x0 = (int)srcX;
     int y0 = (int)srcY;
-    int x1 = min(x0 + 1, inW - 1);
-    int y1 = min(y0 + 1, inH - 1);
+    int x1 = fminf(x0 + 1, inW - 1);
+    int y1 = fminf(y0 + 1, inH - 1);
     
     float dx = srcX - x0;
     float dy = srcY - y0;
@@ -316,8 +315,8 @@ __global__ void upscalingKernel(
                     float nSrcY = ny * scaleY;
                     int nx0 = (int)nSrcX;
                     int ny0 = (int)nSrcY;
-                    int nx1 = min(nx0 + 1, inW - 1);
-                    int ny1 = min(ny0 + 1, inH - 1);
+                    int nx1 = fminf(nx0 + 1, inW - 1);
+                    int ny1 = fminf(ny0 + 1, inH - 1);
                     float ndx = nSrcX - nx0;
                     float ndy = nSrcY - ny0;
                     
@@ -1091,11 +1090,10 @@ static bool present_via_dcomp(DCompContext &ctx, const std::vector<uint8_t>& bgr
 POINT updateOffset;
 IDXGISurface* rawSurface = nullptr;
 
-HRESULT hr = ctx.dcompSurface->BeginDraw(
-    &updateRect,
-    __uuidof(IDXGISurface),
-    (void**)&rawSurface,
-    &updateOffset
+HRESULT BeginDraw(
+  [in, optional] const RECT *updateRect,
+  [in] REFIID iid,
+  [out] void **interface
 );
 
 if (FAILED(hr) || !rawSurface) return false;
@@ -1105,10 +1103,10 @@ ComPtr<IDXGISurface> surface(rawSurface);
 
 // ... use surface as needed below ...
     
-    ComPtr<ID3D11Texture2D> texture;
-    hr = surface->QueryInterface(__uuidof(ID3D11Texture2D), 
-                                reinterpret_cast<void**>(texture.GetAddressOf()));
-    if (FAILED(hr) || !texture) {
+ComPtr<ID3D11Texture2D> texture;
+hr = surface->QueryInterface(__uuidof(ID3D11Texture2D), 
+                            reinterpret_cast<void**>(texture.GetAddressOf()));
+if (FAILED(hr) || !texture) {
         ctx.dcompSurface->EndDraw();
         return false;
     }
